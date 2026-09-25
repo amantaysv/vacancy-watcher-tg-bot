@@ -33,9 +33,15 @@ const DEFAULT_GROUPS: string[] = [
   // "forgoanrust",    // dead — no /s/ preview available
   // "time2find",      // dead — no /s/ preview available
   "opento_dev",
-  "findwork",
-  "remote",
+  "findwork", // DevKG: вакансии (в основном офис, Бишкек)
+  "remote", // DevKG: удалёнка / проекты / релокейт (он же @findremote — не добавлять второй раз)
 ];
+
+// В постах DevKG только заголовок + ссылка на devkg.com, стек и требования
+// лежат на сайте. Для этих каналов при промахе по тексту поста догружаем
+// страницу вакансии и матчим ключевые слова по описанию.
+const DEVKG_GROUPS = new Set(["findwork", "remote"]);
+const DEVKG_LINK = /https?:\/\/devkg\.com\/tg\/j-\d+/;
 
 interface UserState {
   keywords: string[];
@@ -53,7 +59,16 @@ function emptyUser(): UserState {
 
 function loadState(): AppState {
   if (!fs.existsSync(STATE_FILE)) return { users: {}, lastSeen: {} };
-  const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+  let parsed: any;
+  try {
+    parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+  } catch (e) {
+    // Сохраняем битый файл, чтобы первый же saveState не затёр пользователей безвозвратно
+    const broken = `${STATE_FILE}.broken-${Date.now()}`;
+    fs.copyFileSync(STATE_FILE, broken);
+    console.error(`Failed to parse state.json (копия: ${broken}), starting with empty state:`, e);
+    return { users: {}, lastSeen: {} };
+  }
   const users: Record<string, UserState> = parsed.users ?? {};
   // на случай апгрейда со старого state.json без sentMessageIds
   for (const key of Object.keys(users)) {
@@ -152,6 +167,81 @@ async function fetchGroupMessages(username: string): Promise<ScrapedMessage[]> {
   });
 
   return messages.sort((a, b) => a.id - b.id);
+}
+
+// Кэш описаний DevKG: url -> текст (null = не удалось загрузить).
+// /test гоняет одни и те же посты повторно, поэтому кэш заметно экономит запросы.
+const devkgCache = new Map<string, string | null>();
+const DEVKG_CACHE_LIMIT = 500;
+
+async function fetchDevkgDescription(url: string): Promise<string | null> {
+  if (devkgCache.has(url)) return devkgCache.get(url)!;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  let result: string | null = null;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const $ = cheerio.load(await res.text());
+    $("script, style, noscript, header, footer, nav").remove();
+    let text = $("body").text().replace(/\s+/g, " ").trim();
+    // Отрезаем сайдбар с чужими вакансиями, иначе "React" из соседней
+    // вакансии даст ложное совпадение.
+    for (const marker of ["Похожие вакансии", "Другие вакансии компании"]) {
+      const idx = text.indexOf(marker);
+      if (idx !== -1) text = text.slice(0, idx);
+    }
+    result = text || null;
+  } catch (e) {
+    console.error(`[devkg] Не удалось загрузить ${url}:`, e);
+    result = null;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (devkgCache.size >= DEVKG_CACHE_LIMIT) {
+    devkgCache.delete(devkgCache.keys().next().value!);
+  }
+  devkgCache.set(url, result);
+  return result;
+}
+
+interface MatchResult {
+  keyword: string;
+  inDetails: boolean; // true — совпало только в описании на devkg.com
+}
+
+// Ленивая загрузка описания: один запрос на пост, даже если пользователей несколько.
+function lazyDetails(username: string, msg: ScrapedMessage): () => Promise<string | null> {
+  let promise: Promise<string | null> | undefined;
+  return () => {
+    if (!DEVKG_GROUPS.has(username)) return Promise.resolve(null);
+    const url = msg.text.match(DEVKG_LINK)?.[0];
+    if (!url) return Promise.resolve(null);
+    promise ??= fetchDevkgDescription(url);
+    return promise;
+  };
+}
+
+async function findMatch(msg: ScrapedMessage, pattern: RegExp, getDetails: () => Promise<string | null>): Promise<MatchResult | null> {
+  const direct = pattern.exec(msg.text);
+  if (direct) return { keyword: direct[1], inDetails: false };
+  const details = await getDetails();
+  if (!details) return null;
+  const deep = pattern.exec(details);
+  return deep ? { keyword: deep[1], inDetails: true } : null;
+}
+
+function formatBody(username: string, msg: ScrapedMessage, match: MatchResult): string {
+  const postLink = `https://t.me/${username}/${msg.id}`;
+  const bodyText = msg.html.length <= 3800 ? msg.html : safeBody(msg.html, msg.text, 3800);
+  const where = match.inDetails ? " <i>(в описании на devkg.com)</i>" : "";
+  return `🔎 <b>${escapeHtml(match.keyword)}</b>${where}\n` + `📍 <a href="${postLink}">${username}</a>\n\n` + bodyText;
 }
 
 async function main() {
@@ -282,13 +372,10 @@ async function main() {
         const recent = messages.filter((m) => m.date !== null && m.date.getTime() >= cutoff);
         console.log(`[test] [${username}] fetched=${messages.length} recent${days}d=${recent.length}`);
         for (const msg of recent) {
-          const match = pattern.exec(msg.text);
+          const match = await findMatch(msg, pattern, lazyDetails(username, msg));
           if (match) {
             found++;
-            const postLink = `https://t.me/${username}/${msg.id}`;
-            const bodyText = msg.html.length <= 3800 ? msg.html : safeBody(msg.html, msg.text, 3800);
-            const body = `🔎 <b>${escapeHtml(match[1])}</b>\n` + `📍 <a href="${postLink}">${username}</a>\n\n` + bodyText;
-            const sent = await ctx.reply(body, { parse_mode: "HTML" });
+            const sent = await ctx.reply(formatBody(username, msg, match), { parse_mode: "HTML" });
             trackSent(ctx.chat.id, sent.message_id);
           }
         }
@@ -364,15 +451,14 @@ async function main() {
       saveState(state);
 
       for (const msg of newMessages) {
+        const getDetails = lazyDetails(username, msg);
         for (const [chatIdStr, user] of Object.entries(state.users)) {
           const pattern = buildKeywordRegex(user.keywords);
           if (!pattern) continue;
-          const match = pattern.exec(msg.text);
+          const match = await findMatch(msg, pattern, getDetails);
           if (!match) continue;
 
-          const postLink = `https://t.me/${username}/${msg.id}`;
-          const bodyText = msg.html.length <= 3800 ? msg.html : safeBody(msg.html, msg.text, 3800);
-          const body = `🔎 <b>${escapeHtml(match[1])}</b>\n` + `📍 <a href="${postLink}">${username}</a>\n\n` + bodyText;
+          const body = formatBody(username, msg, match);
 
           try {
             const sent = await bot.telegram.sendMessage(Number(chatIdStr), body, {
