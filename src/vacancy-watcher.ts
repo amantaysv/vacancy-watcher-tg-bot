@@ -33,6 +33,8 @@ const DEFAULT_GROUPS: string[] = [
   // "forgoanrust",    // dead — no /s/ preview available
   // "time2find",      // dead — no /s/ preview available
   "opento_dev",
+  "findwork",
+  "remote",
 ];
 
 interface UserState {
